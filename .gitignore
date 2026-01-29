@@ -1,0 +1,15 @@
+# 用户配置（包含 API Key 等敏感信息）
+settings.json
+
+# 恢复的聊天记录
+chat-recovery/
+
+# Node.js
+node_modules/
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
