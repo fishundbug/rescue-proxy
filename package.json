@@ -1,0 +1,9 @@
+{
+  "name": "rescue-proxy",
+  "version": "1.0.0",
+  "description": "SillyTavern AI API 中转代理插件 - 确保 AI 回复在浏览器断开时也能保存",
+  "main": "index.js",
+  "type": "module",
+  "author": "SillyTavern User",
+  "license": "MIT"
+}
