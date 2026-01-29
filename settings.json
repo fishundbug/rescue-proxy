@@ -1,6 +1,0 @@
-{
-  "realApiUrl": "http://192.168.50.24:8317/v1",
-  "realApiKey": "sk-cliproxyapikey1",
-  "proxyPort": 5501,
-  "proxyApiKey": "sk-sillytavernapikey1"
-}
