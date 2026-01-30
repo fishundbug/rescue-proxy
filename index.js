@@ -51,12 +51,13 @@ let cachedSettings = null;
 // 用户目录存储（由前端上报）
 const userDirectoriesCache = new Map();
 
-// 最近的聊天上下文（由前端在发送消息时注册）
+// 最近的聊天上下文（由前端在发送消息前同步）
+// 用于 SillyTavern 后端发出的请求（不经过浏览器）
 let lastChatContext = null;
 
-// 待保存的消息（延迟保存机制）
-// 结构：{ content, model, genStarted, genFinished, chatContext, userDirectories, timeoutId }
-let pendingSave = null;
+// 待保存的请求（多请求并发支持）
+// 结构：requestId → { content, model, genStarted, genFinished, chatContext, userDirectories, timeoutId }
+const pendingRequests = new Map();
 
 // 延迟保存超时时间（毫秒）
 const SAVE_DELAY_MS = 5000;
@@ -163,7 +164,8 @@ export async function init(router) {
         res.json({ success: true });
     });
 
-    // 设置当前聊天上下文（前端在发送消息时调用）
+    // 设置当前聊天上下文（前端在发送消息前调用）
+    // 用于 SillyTavern 后端发出的请求（不带 X-Chat-Context header）
     router.post('/set-chat-context', (req, res) => {
         lastChatContext = req.body;
         console.log(`[rescue-proxy] 已设置聊天上下文: ${lastChatContext?.characterName || 'unknown'}`);
@@ -172,11 +174,26 @@ export async function init(router) {
 
     // 确认已收到消息（浏览器在成功接收 AI 响应后调用）
     router.post('/confirm-received', (req, res) => {
-        if (pendingSave) {
-            clearTimeout(pendingSave.timeoutId);
-            console.log('[rescue-proxy] 浏览器已确认收到消息，取消延迟保存');
-            pendingSave = null;
+        const { requestId } = req.body;
+
+        if (requestId && pendingRequests.has(requestId)) {
+            // 精确匹配：取消指定 requestId 的待保存
+            const pending = pendingRequests.get(requestId);
+            clearTimeout(pending.timeoutId);
+            pendingRequests.delete(requestId);
+            console.log(`[rescue-proxy] 浏览器已确认收到消息，取消延迟保存 (requestId: ${requestId})`);
+        } else if (pendingRequests.size > 0) {
+            // 不匹配或无 requestId：取消最近一条待保存
+            // （适用于 SillyTavern 后端发出请求的场景，此时前端和后端的 requestId 不同）
+            const lastKey = Array.from(pendingRequests.keys()).pop();
+            const lastPending = pendingRequests.get(lastKey);
+            if (lastPending) {
+                clearTimeout(lastPending.timeoutId);
+                pendingRequests.delete(lastKey);
+                console.log(`[rescue-proxy] 浏览器已确认收到消息，取消最近一条延迟保存 (key: ${lastKey})`);
+            }
         }
+
         res.json({ success: true });
     });
 
@@ -427,7 +444,7 @@ function startProxyServer() {
         // 设置 CORS 允许所有来源
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Chat-Context, X-User-Handle, X-Rescue-Token');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Chat-Context, X-User-Handle, X-Rescue-Token, X-Request-Id');
 
         // 处理 OPTIONS 预检请求
         if (req.method === 'OPTIONS') {
@@ -461,6 +478,13 @@ function startProxyServer() {
         }
 
         // 路由
+
+        // 健康检查端点 - 用于前端测试代理服务器连接
+        if (url === '/health' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'ok', port: getSettings().proxyPort }));
+            return;
+        }
 
         // 模型列表端点 - 用于 SillyTavern 连接测试
         if ((url === '/v1/models' || url === '/models') && req.method === 'GET') {
@@ -536,8 +560,25 @@ async function handleChatCompletions(req, res) {
     const settings = getSettings();
     const userDirectories = userDirectoriesCache.get('default');
 
-    // 使用前端注册的聊天上下文（方案 B）
-    const chatContext = lastChatContext;
+    // 从请求头获取聊天上下文（优先）或使用前端同步的上下文（回退）
+    let chatContext = null;
+    try {
+        const chatContextHeader = req.headers['x-chat-context'];
+        if (chatContextHeader) {
+            chatContext = JSON.parse(chatContextHeader);
+        }
+    } catch (e) {
+        console.warn('[rescue-proxy] 解析 X-Chat-Context 失败:', e);
+    }
+
+    // 如果没有从请求头获取到，使用前端同步的 lastChatContext
+    if (!chatContext && lastChatContext) {
+        chatContext = lastChatContext;
+        console.log('[rescue-proxy] 使用前端同步的 chatContext');
+    }
+
+    // 获取请求 ID（用于多请求并发追踪）
+    const requestId = req.headers['x-request-id'] || `fallback-${Date.now()}`;
 
     const isStreaming = reqBody.stream === true;
     const model = reqBody.model || 'unknown';
@@ -551,9 +592,8 @@ async function handleChatCompletions(req, res) {
         messages[0]?.content === 'Hi';
 
     // 调试日志
-    console.log(`[rescue-proxy] 收到请求 - 模型: ${model}, 流式: ${isStreaming}, 测试消息: ${isTestMessage}`);
+    console.log(`[rescue-proxy] 收到请求 - 模型: ${model}, 流式: ${isStreaming}, 测试消息: ${isTestMessage}, requestId: ${requestId}`);
     console.log(`[rescue-proxy] 调试 - chatContext: ${chatContext ? JSON.stringify(chatContext) : 'null'}`);
-    console.log(`[rescue-proxy] 调试 - userDirectories: ${userDirectories ? '已获取' : 'null'}`);
 
     if (!settings.realApiKey) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -586,9 +626,9 @@ async function handleChatCompletions(req, res) {
         }
 
         if (isStreaming) {
-            await handleStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage);
+            await handleStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage, requestId);
         } else {
-            await handleNonStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage);
+            await handleNonStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage, requestId);
         }
 
     } catch (error) {
@@ -606,7 +646,7 @@ async function handleChatCompletions(req, res) {
 /**
  * 处理流式响应
  */
-async function handleStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false) {
+async function handleStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId = null) {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -655,7 +695,7 @@ async function handleStreamingResponse(res, apiResponse, chatContext, userDirect
     // 保存到聊天记录（跳过测试消息）
     const genFinished = new Date().toISOString();
     if (!hasError && fullContent && chatContext && userDirectories && !isTestMessage) {
-        scheduleSave(userDirectories, chatContext, fullContent, model, genStarted, genFinished);
+        scheduleSave(requestId || `fallback-${Date.now()}`, userDirectories, chatContext, fullContent, model, genStarted, genFinished);
     } else {
         console.log(`[rescue-proxy] 跳过保存 - hasError: ${hasError}, hasContent: ${!!fullContent}, hasChatContext: ${!!chatContext}, hasUserDirs: ${!!userDirectories}, isTestMessage: ${isTestMessage}`);
     }
@@ -664,7 +704,7 @@ async function handleStreamingResponse(res, apiResponse, chatContext, userDirect
 /**
  * 处理非流式响应
  */
-async function handleNonStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false) {
+async function handleNonStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId = null) {
     try {
         const data = await apiResponse.json();
 
@@ -676,7 +716,7 @@ async function handleNonStreamingResponse(res, apiResponse, chatContext, userDir
         const genFinished = new Date().toISOString();
 
         if (content && chatContext && userDirectories && !isTestMessage) {
-            scheduleSave(userDirectories, chatContext, content, model, genStarted, genFinished);
+            scheduleSave(requestId || `fallback-${Date.now()}`, userDirectories, chatContext, content, model, genStarted, genFinished);
         } else {
             console.log(`[rescue-proxy] 跳过保存 - hasContent: ${!!content}, hasChatContext: ${!!chatContext}, hasUserDirs: ${!!userDirectories}, isTestMessage: ${isTestMessage}`);
         }
@@ -691,23 +731,25 @@ async function handleNonStreamingResponse(res, apiResponse, chatContext, userDir
 /**
  * 延迟保存到聊天记录
  * 设置超时等待浏览器确认，若未确认则执行保存
+ * @param {string} requestId 请求 ID，用于多请求并发追踪
  */
-function scheduleSave(userDirectories, chatContext, content, modelName, genStarted, genFinished) {
-    // 取消之前的待保存任务
-    if (pendingSave) {
-        clearTimeout(pendingSave.timeoutId);
+function scheduleSave(requestId, userDirectories, chatContext, content, modelName, genStarted, genFinished) {
+    // 如果已有相同 requestId 的待保存任务，先取消
+    if (pendingRequests.has(requestId)) {
+        clearTimeout(pendingRequests.get(requestId).timeoutId);
     }
 
     // 设置延迟保存
     const timeoutId = setTimeout(() => {
-        if (pendingSave) {
-            console.log('[rescue-proxy] 浏览器未确认收到消息，执行延迟保存');
-            executeSave(pendingSave);
-            pendingSave = null;
+        const pending = pendingRequests.get(requestId);
+        if (pending) {
+            console.log(`[rescue-proxy] 浏览器未确认收到消息，执行延迟保存 (requestId: ${requestId})`);
+            executeSave(pending);
+            pendingRequests.delete(requestId);
         }
     }, SAVE_DELAY_MS);
 
-    pendingSave = {
+    pendingRequests.set(requestId, {
         content,
         modelName,
         genStarted,
@@ -715,9 +757,9 @@ function scheduleSave(userDirectories, chatContext, content, modelName, genStart
         chatContext,
         userDirectories,
         timeoutId,
-    };
+    });
 
-    console.log(`[rescue-proxy] 已设置延迟保存，等待 ${SAVE_DELAY_MS}ms 确认...`);
+    console.log(`[rescue-proxy] 已设置延迟保存 (requestId: ${requestId})，等待 ${SAVE_DELAY_MS}ms 确认...`);
 }
 
 /**
