@@ -52,7 +52,6 @@ export function writeChatFile(chatFilePath, chatData) {
 
         const jsonlContent = chatData.map(item => JSON.stringify(item)).join('\n');
         fs.writeFileSync(chatFilePath, jsonlContent, 'utf-8');
-        console.log(`[rescue-proxy] 聊天文件已保存: ${chatFilePath}`);
     } catch (error) {
         console.error(`[rescue-proxy] 写入聊天文件失败:`, error);
         throw error;
@@ -153,7 +152,7 @@ export function createMessageObject(options) {
  * @param {Object} userDirectories - 用户目录配置
  * @param {Object} chatContext - 聊天上下文
  * @param {Object} messageOptions - 消息选项
- * @returns {{success: boolean, error?: string}}
+ * @returns {{success: boolean, chatFilePath?: string, error?: string}}
  */
 export function appendMessageToChat(userDirectories, chatContext, messageOptions) {
     try {
@@ -184,8 +183,8 @@ export function appendMessageToChat(userDirectories, chatContext, messageOptions
         // 写回文件
         writeChatFile(chatFilePath, chatData);
 
-        console.log(`[rescue-proxy] 消息已追加到聊天: ${chatContext.characterName}`);
-        return { success: true };
+        // 返回文件路径供调用方打印日志
+        return { success: true, chatFilePath };
 
     } catch (error) {
         console.error(`[rescue-proxy] 追加消息失败:`, error);

@@ -766,7 +766,7 @@ function executeSave(saveData) {
         });
 
         if (result.success) {
-            console.log('[rescue-proxy] 消息已保存到聊天记录（延迟保存）');
+            console.log(`[rescue-proxy] 延迟保存成功: ${saveData.chatContext?.characterName || 'unknown'} → ${result.chatFilePath || 'unknown'}`);
         } else {
             console.error(`[rescue-proxy] 保存失败: ${result.error}`);
         }
