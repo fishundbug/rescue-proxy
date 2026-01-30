@@ -173,24 +173,15 @@ export async function init(router) {
     });
 
     // 确认已收到消息（浏览器在成功接收 AI 响应后调用）
+    // 取消最近一条待保存任务
     router.post('/confirm-received', (req, res) => {
-        const { requestId } = req.body;
-
-        if (requestId && pendingRequests.has(requestId)) {
-            // 精确匹配：取消指定 requestId 的待保存
-            const pending = pendingRequests.get(requestId);
-            clearTimeout(pending.timeoutId);
-            pendingRequests.delete(requestId);
-            console.log(`[rescue-proxy] 浏览器已确认收到消息，取消延迟保存 (requestId: ${requestId})`);
-        } else if (pendingRequests.size > 0) {
-            // 不匹配或无 requestId：取消最近一条待保存
-            // （适用于 SillyTavern 后端发出请求的场景，此时前端和后端的 requestId 不同）
+        if (pendingRequests.size > 0) {
             const lastKey = Array.from(pendingRequests.keys()).pop();
             const lastPending = pendingRequests.get(lastKey);
             if (lastPending) {
                 clearTimeout(lastPending.timeoutId);
                 pendingRequests.delete(lastKey);
-                console.log(`[rescue-proxy] 浏览器已确认收到消息，取消最近一条延迟保存 (key: ${lastKey})`);
+                console.log('[rescue-proxy] 浏览器已确认收到消息，取消延迟保存');
             }
         }
 
@@ -444,7 +435,7 @@ function startProxyServer() {
         // 设置 CORS 允许所有来源
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Chat-Context, X-User-Handle, X-Rescue-Token, X-Request-Id');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Chat-Context, X-User-Handle, X-Rescue-Token');
 
         // 处理 OPTIONS 预检请求
         if (req.method === 'OPTIONS') {
@@ -577,8 +568,8 @@ async function handleChatCompletions(req, res) {
         console.log('[rescue-proxy] 使用前端同步的 chatContext');
     }
 
-    // 获取请求 ID（用于多请求并发追踪）
-    const requestId = req.headers['x-request-id'] || `fallback-${Date.now()}`;
+    // 生成请求 ID（用于 Map key 追踪，仅内部使用）
+    const requestId = `req-${Date.now()}`;
 
     const isStreaming = reqBody.stream === true;
     const model = reqBody.model || 'unknown';
@@ -592,8 +583,7 @@ async function handleChatCompletions(req, res) {
         messages[0]?.content === 'Hi';
 
     // 调试日志
-    console.log(`[rescue-proxy] 收到请求 - 模型: ${model}, 流式: ${isStreaming}, 测试消息: ${isTestMessage}, requestId: ${requestId}`);
-    console.log(`[rescue-proxy] 调试 - chatContext: ${chatContext ? JSON.stringify(chatContext) : 'null'}`);
+    console.log(`[rescue-proxy] 收到请求 - 模型: ${model}, 流式: ${isStreaming}, 测试消息: ${isTestMessage}`);
 
     if (!settings.realApiKey) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -646,7 +636,7 @@ async function handleChatCompletions(req, res) {
 /**
  * 处理流式响应
  */
-async function handleStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId = null) {
+async function handleStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId) {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -704,7 +694,7 @@ async function handleStreamingResponse(res, apiResponse, chatContext, userDirect
 /**
  * 处理非流式响应
  */
-async function handleNonStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId = null) {
+async function handleNonStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId) {
     try {
         const data = await apiResponse.json();
 
