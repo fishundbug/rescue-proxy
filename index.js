@@ -293,64 +293,119 @@ export async function init(router) {
     // 检查 GitHub 更新
     router.get('/check-update', async (req, res) => {
         try {
-            // GitHub 仓库信息
             const owner = 'fishundbug';
-            const repo = 'rescue-proxy';
+            const userDirectories = req.user?.directories;
 
-            // 获取当前本地版本（从 package.json 读取）
-            const packagePath = path.join(__dirname, 'package.json');
-            let localVersion = 'unknown';
-            let localCommit = null;
-
-            if (fs.existsSync(packagePath)) {
-                const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
-                localVersion = pkg.version || 'unknown';
-            }
-
-            // 尝试获取本地 git commit
-            const gitHeadPath = path.join(__dirname, '.git', 'HEAD');
-            if (fs.existsSync(gitHeadPath)) {
-                const headContent = fs.readFileSync(gitHeadPath, 'utf-8').trim();
-                if (headContent.startsWith('ref: ')) {
-                    const refPath = path.join(__dirname, '.git', headContent.slice(5));
-                    if (fs.existsSync(refPath)) {
-                        localCommit = fs.readFileSync(refPath, 'utf-8').trim().slice(0, 7);
-                    }
-                } else {
-                    localCommit = headContent.slice(0, 7);
+            // 获取前端扩展路径（优先全局安装，其次用户安装）
+            const getUiExtensionPath = () => {
+                // 全局安装路径
+                const globalPath = path.join(process.cwd(), 'public', 'scripts', 'extensions', 'third-party', 'rescue-proxy-ui');
+                if (fs.existsSync(globalPath)) {
+                    return { path: globalPath, type: '全局' };
                 }
-            }
+                // 用户安装路径
+                if (userDirectories?.extensions) {
+                    const userPath = path.join(userDirectories.extensions, 'rescue-proxy-ui');
+                    if (fs.existsSync(userPath)) {
+                        return { path: userPath, type: '用户' };
+                    }
+                }
+                return { path: null, type: null };
+            };
 
-            // 调用 GitHub API 获取最新提交
-            const apiUrl = `https://api.github.com/repos/${owner}/${repo}/commits?per_page=1`;
-            const response = await fetch(apiUrl, {
-                headers: {
-                    'User-Agent': 'SillyTavern-RescueProxy',
-                    'Accept': 'application/vnd.github.v3+json',
+            const uiExtension = getUiExtensionPath();
+
+            // 定义要检查的仓库
+            const repos = [
+                {
+                    name: '后端插件',
+                    repo: 'rescue-proxy',
+                    localPath: __dirname,
                 },
-            });
+                {
+                    name: `前端扩展${uiExtension.type ? ` (${uiExtension.type})` : ''}`,
+                    repo: 'rescue-proxy-ui',
+                    localPath: uiExtension.path,
+                },
+            ];
 
-            if (!response.ok) {
-                throw new Error(`GitHub API 请求失败: ${response.status}`);
+            const results = [];
+
+            for (const { name, repo, localPath } of repos) {
+                let localCommit = null;
+                let localVersion = 'unknown';
+
+                // 获取本地版本
+                if (localPath) {
+                    const packagePath = path.join(localPath, 'package.json');
+                    const manifestPath = path.join(localPath, 'manifest.json');
+
+                    if (fs.existsSync(packagePath)) {
+                        const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
+                        localVersion = pkg.version || 'unknown';
+                    } else if (fs.existsSync(manifestPath)) {
+                        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+                        localVersion = manifest.version || 'unknown';
+                    }
+
+                    // 获取本地 git commit
+                    const gitHeadPath = path.join(localPath, '.git', 'HEAD');
+                    if (fs.existsSync(gitHeadPath)) {
+                        const headContent = fs.readFileSync(gitHeadPath, 'utf-8').trim();
+                        if (headContent.startsWith('ref: ')) {
+                            const refPath = path.join(localPath, '.git', headContent.slice(5));
+                            if (fs.existsSync(refPath)) {
+                                localCommit = fs.readFileSync(refPath, 'utf-8').trim().slice(0, 7);
+                            }
+                        } else {
+                            localCommit = headContent.slice(0, 7);
+                        }
+                    }
+                }
+
+                // 调用 GitHub API 获取最新提交
+                let latestCommit = null;
+                let latestMessage = '';
+
+                try {
+                    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/commits?per_page=1`;
+                    const response = await fetch(apiUrl, {
+                        headers: {
+                            'User-Agent': 'SillyTavern-RescueProxy',
+                            'Accept': 'application/vnd.github.v3+json',
+                        },
+                    });
+
+                    if (response.ok) {
+                        const commits = await response.json();
+                        latestCommit = commits[0]?.sha?.slice(0, 7) || null;
+                        latestMessage = commits[0]?.commit?.message?.split('\n')[0] || '';
+                    }
+                } catch (e) {
+                    console.error(`[rescue-proxy] 获取 ${repo} 更新失败:`, e);
+                }
+
+                const hasUpdate = localCommit && latestCommit && localCommit !== latestCommit;
+
+                results.push({
+                    name,
+                    repo,
+                    localVersion,
+                    localCommit,
+                    latestCommit,
+                    latestMessage,
+                    hasUpdate,
+                    repoUrl: `https://github.com/${owner}/${repo}`,
+                });
             }
 
-            const commits = await response.json();
-            const latestCommit = commits[0]?.sha?.slice(0, 7) || null;
-            const latestMessage = commits[0]?.commit?.message?.split('\n')[0] || '';
-            const latestDate = commits[0]?.commit?.author?.date || null;
-
-            // 判断是否有更新
-            const hasUpdate = localCommit && latestCommit && localCommit !== latestCommit;
+            // 总体是否有更新
+            const hasAnyUpdate = results.some(r => r.hasUpdate);
 
             res.json({
                 success: true,
-                localVersion,
-                localCommit,
-                latestCommit,
-                latestMessage,
-                latestDate,
-                hasUpdate,
-                repoUrl: `https://github.com/${owner}/${repo}`,
+                hasAnyUpdate,
+                repos: results,
             });
         } catch (error) {
             console.error('[rescue-proxy] 检查更新失败:', error);
