@@ -4,6 +4,14 @@
   "description": "SillyTavern AI API 中转代理插件 - 确保 AI 回复在浏览器断开时也能保存",
   "main": "index.js",
   "type": "module",
-  "author": "SillyTavern User",
-  "license": "MIT"
+  "author": "fishundbug",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fishundbug/rescue-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fishundbug/rescue-proxy/issues"
+  },
+  "homepage": "https://github.com/fishundbug/rescue-proxy#readme"
 }
