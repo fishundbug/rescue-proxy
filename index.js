@@ -62,8 +62,140 @@ const pendingRequests = new Map();
 // 延迟保存超时时间（毫秒）
 const SAVE_DELAY_MS = 5000;
 
+// 请求日志存储（内存缓存）
+const MAX_LOG_ENTRIES = 100;
+const requestLogs = [];
+
+// 日志文件配置
+const LOGS_DIR = path.join(__dirname, 'logs');
+const LOGS_FILE = path.join(LOGS_DIR, 'request-logs.jsonl');
+const MAX_LOG_FILE_SIZE = 2 * 1024 * 1024; // 2MB 大小上限
+const TRIM_PERCENTAGE = 0.15; // 超限时删除最早 15% 的日志
+
 // 独立服务器实例
 let proxyServer = null;
+
+/**
+ * 确保日志目录存在
+ */
+function ensureLogsDir() {
+    if (!fs.existsSync(LOGS_DIR)) {
+        fs.mkdirSync(LOGS_DIR, { recursive: true });
+    }
+}
+
+/**
+ * 从文件加载日志到内存
+ */
+function loadLogsFromFile() {
+    try {
+        if (!fs.existsSync(LOGS_FILE)) {
+            return;
+        }
+        const content = fs.readFileSync(LOGS_FILE, 'utf-8');
+        const lines = content.trim().split('\n').filter(line => line);
+
+        // 解析每行 JSON，取最近 MAX_LOG_ENTRIES 条
+        const allLogs = [];
+        for (const line of lines) {
+            try {
+                allLogs.push(JSON.parse(line));
+            } catch {
+                // 忽略解析错误的行
+            }
+        }
+
+        // 取最近的日志加载到内存（文件中是按时间顺序，最新的在最后）
+        const recentLogs = allLogs.slice(-MAX_LOG_ENTRIES).reverse();
+        requestLogs.push(...recentLogs);
+        console.log(`[rescue-proxy] 已从文件加载 ${recentLogs.length} 条日志`);
+    } catch (error) {
+        console.error('[rescue-proxy] 加载日志文件失败:', error);
+    }
+}
+
+/**
+ * 将日志条目追加到文件
+ * @param {Object} logEntry - 日志条目
+ */
+function appendLogToFile(logEntry) {
+    try {
+        ensureLogsDir();
+        fs.appendFileSync(LOGS_FILE, JSON.stringify(logEntry) + '\n', 'utf-8');
+
+        // 检查文件大小，超限时截断
+        const stats = fs.statSync(LOGS_FILE);
+        if (stats.size > MAX_LOG_FILE_SIZE) {
+            trimLogFile();
+        }
+    } catch (error) {
+        console.error('[rescue-proxy] 写入日志文件失败:', error);
+    }
+}
+
+/**
+ * 截断日志文件（删除最早的 15%）
+ */
+function trimLogFile() {
+    try {
+        const content = fs.readFileSync(LOGS_FILE, 'utf-8');
+        const lines = content.trim().split('\n').filter(line => line);
+
+        const trimCount = Math.floor(lines.length * TRIM_PERCENTAGE);
+        const remainingLines = lines.slice(trimCount);
+
+        fs.writeFileSync(LOGS_FILE, remainingLines.join('\n') + '\n', 'utf-8');
+        console.log(`[rescue-proxy] 日志文件已截断，删除了 ${trimCount} 条最早的日志`);
+    } catch (error) {
+        console.error('[rescue-proxy] 截断日志文件失败:', error);
+    }
+}
+
+/**
+ * 清空日志文件
+ */
+function clearLogFile() {
+    try {
+        ensureLogsDir();
+        fs.writeFileSync(LOGS_FILE, '', 'utf-8');
+    } catch (error) {
+        console.error('[rescue-proxy] 清空日志文件失败:', error);
+    }
+}
+
+/**
+ * 添加请求日志（仅添加到内存）
+ * @param {Object} logEntry - 日志条目
+ */
+function addRequestLog(logEntry) {
+    const entry = {
+        ...logEntry,
+        timestamp: new Date().toISOString(),
+    };
+
+    // 只添加到内存（不写入文件，等请求完成时再写入）
+    requestLogs.unshift(entry);
+    if (requestLogs.length > MAX_LOG_ENTRIES) {
+        requestLogs.pop();
+    }
+}
+
+/**
+ * 更新请求日志并写入文件（请求完成时调用）
+ * @param {string} requestId - 请求 ID
+ * @param {Object} updates - 要更新的字段
+ */
+function updateRequestLog(requestId, updates) {
+    const logIndex = requestLogs.findIndex(l => l.id === requestId);
+    if (logIndex !== -1) {
+        const log = requestLogs[logIndex];
+        Object.assign(log, updates);
+        // 请求完成后写入文件（包含最终状态）
+        appendLogToFile(log);
+        // 从内存中移除（已完成的记录只保存在文件中）
+        requestLogs.splice(logIndex, 1);
+    }
+}
 
 /**
  * 从文件加载设置
@@ -81,6 +213,7 @@ function loadSettingsFromFile() {
         console.error('[rescue-proxy] 加载设置文件失败:', error);
         cachedSettings = { ...defaultSettings };
     }
+
     return cachedSettings;
 }
 
@@ -186,6 +319,55 @@ export async function init(router) {
         }
 
         res.json({ success: true });
+    });
+
+    // 获取 pending 日志（内存中未完成的请求）
+    router.get('/request-logs', (req, res) => {
+        res.json({ logs: requestLogs });
+    });
+
+    // 清理日志文件（不影响内存中的 pending 记录）
+    router.post('/clear-logs', (req, res) => {
+        clearLogFile();
+        console.log('[rescue-proxy] 日志文件已清理');
+        res.json({ success: true });
+    });
+
+    // 获取历史日志（从文件读取，支持分页）
+    // 参数：offset - 跳过条数，limit - 返回条数
+    router.get('/history-logs', (req, res) => {
+        try {
+            if (!fs.existsSync(LOGS_FILE)) {
+                return res.json({ logs: [], total: 0, hasMore: false });
+            }
+
+            const offset = parseInt(req.query.offset) || 0;
+            const limit = parseInt(req.query.limit) || 80;
+
+            const content = fs.readFileSync(LOGS_FILE, 'utf-8');
+            const lines = content.trim().split('\n').filter(line => line);
+
+            let logs = [];
+            for (const line of lines) {
+                try {
+                    logs.push(JSON.parse(line));
+                } catch {
+                    // 忽略解析错误的行
+                }
+            }
+
+            // 按时间倒序排列（最新的在前）
+            logs.reverse();
+
+            const total = logs.length;
+            const resultLogs = logs.slice(offset, offset + limit);
+            const hasMore = offset + limit < total;
+
+            res.json({ logs: resultLogs, total, hasMore });
+        } catch (error) {
+            console.error('[rescue-proxy] 读取历史日志失败:', error);
+            res.json({ logs: [], total: 0, hasMore: false });
+        }
     });
 
     // 获取可导入的配置列表（排除本插件端点）
@@ -585,6 +767,19 @@ async function handleChatCompletions(req, res) {
     // 调试日志
     console.log(`[rescue-proxy] 收到请求 - 模型: ${model}, 流式: ${isStreaming}, 测试消息: ${isTestMessage}`);
 
+    // 记录请求日志（初始状态）
+    const requestStartTime = Date.now();
+    addRequestLog({
+        id: requestId,
+        model,
+        character: chatContext?.characterName || 'unknown',
+        status: 'pending',
+        streaming: isStreaming,
+        isTest: isTestMessage,
+        responseTime: null,
+        error: null,
+    });
+
     if (!settings.realApiKey) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -616,13 +811,18 @@ async function handleChatCompletions(req, res) {
         }
 
         if (isStreaming) {
-            await handleStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage, requestId);
+            await handleStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage, requestId, requestStartTime);
         } else {
-            await handleNonStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage, requestId);
+            await handleNonStreamingResponse(res, response, chatContext, userDirectories, model, genStarted, isTestMessage, requestId, requestStartTime);
         }
 
     } catch (error) {
         console.error('[rescue-proxy] 请求错误:', error);
+        updateRequestLog(requestId, {
+            status: 'error',
+            responseTime: Date.now() - requestStartTime,
+            error: error.message,
+        });
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             error: {
@@ -636,7 +836,7 @@ async function handleChatCompletions(req, res) {
 /**
  * 处理流式响应
  */
-async function handleStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId) {
+async function handleStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId, requestStartTime) {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -689,12 +889,18 @@ async function handleStreamingResponse(res, apiResponse, chatContext, userDirect
     } else {
         console.log(`[rescue-proxy] 跳过保存 - hasError: ${hasError}, hasContent: ${!!fullContent}, hasChatContext: ${!!chatContext}, hasUserDirs: ${!!userDirectories}, isTestMessage: ${isTestMessage}`);
     }
+
+    // 更新请求日志
+    updateRequestLog(requestId, {
+        status: hasError ? 'error' : 'success',
+        responseTime: Date.now() - requestStartTime,
+    });
 }
 
 /**
  * 处理非流式响应
  */
-async function handleNonStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId) {
+async function handleNonStreamingResponse(res, apiResponse, chatContext, userDirectories, model, genStarted, isTestMessage = false, requestId, requestStartTime) {
     try {
         const data = await apiResponse.json();
 
@@ -711,8 +917,19 @@ async function handleNonStreamingResponse(res, apiResponse, chatContext, userDir
             console.log(`[rescue-proxy] 跳过保存 - hasContent: ${!!content}, hasChatContext: ${!!chatContext}, hasUserDirs: ${!!userDirectories}, isTestMessage: ${isTestMessage}`);
         }
 
+        // 更新请求日志
+        updateRequestLog(requestId, {
+            status: 'success',
+            responseTime: Date.now() - requestStartTime,
+        });
+
     } catch (error) {
         console.error('[rescue-proxy] 非流式响应处理错误:', error);
+        updateRequestLog(requestId, {
+            status: 'error',
+            responseTime: Date.now() - requestStartTime,
+            error: error.message,
+        });
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: error.message, type: 'parse_error' } }));
     }
