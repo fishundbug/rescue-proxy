@@ -72,6 +72,51 @@ const LOGS_FILE = path.join(LOGS_DIR, 'request-logs.jsonl');
 const MAX_LOG_FILE_SIZE = 2 * 1024 * 1024; // 2MB 大小上限
 const TRIM_PERCENTAGE = 0.15; // 超限时删除最早 15% 的日志
 
+// 终端日志缓冲区
+const MAX_CONSOLE_LOGS = 500;
+const consoleLogs = [];
+
+// 拦截 console.log 收集后端日志
+const originalConsoleLog = console.log;
+const originalConsoleError = console.error;
+const originalConsoleWarn = console.warn;
+
+/**
+ * 添加日志到缓冲区
+ */
+function addConsoleLog(level, args) {
+    const message = args.map(arg =>
+        typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
+    ).join(' ');
+
+    consoleLogs.push({
+        timestamp: Date.now(),
+        level,
+        source: 'backend',
+        message
+    });
+
+    // 保持缓冲区大小
+    while (consoleLogs.length > MAX_CONSOLE_LOGS) {
+        consoleLogs.shift();
+    }
+}
+
+console.log = function (...args) {
+    addConsoleLog('log', args);
+    originalConsoleLog.apply(console, args);
+};
+
+console.error = function (...args) {
+    addConsoleLog('error', args);
+    originalConsoleError.apply(console, args);
+};
+
+console.warn = function (...args) {
+    addConsoleLog('warn', args);
+    originalConsoleWarn.apply(console, args);
+};
+
 // 独立服务器实例
 let proxyServer = null;
 
@@ -369,6 +414,37 @@ export async function init(router) {
             res.json({ logs: [], total: 0, hasMore: false });
         }
     });
+
+    // 获取终端日志
+    // 参数：since - 只返回该时间戳之后的日志
+    router.get('/console-logs', (req, res) => {
+        const since = parseInt(req.query.since) || 0;
+        const logs = since > 0
+            ? consoleLogs.filter(log => log.timestamp > since)
+            : consoleLogs;
+        res.json({ logs });
+    });
+
+    // 接收前端日志
+    router.post('/console-logs', (req, res) => {
+        const { logs } = req.body;
+        if (Array.isArray(logs)) {
+            for (const log of logs) {
+                consoleLogs.push({
+                    timestamp: log.timestamp || Date.now(),
+                    level: log.level || 'log',
+                    source: 'frontend',
+                    message: log.message || ''
+                });
+            }
+            // 保持缓冲区大小
+            while (consoleLogs.length > MAX_CONSOLE_LOGS) {
+                consoleLogs.shift();
+            }
+        }
+        res.json({ success: true });
+    });
+
 
     // 获取可导入的配置列表（排除本插件端点）
     router.get('/available-profiles', (req, res) => {
