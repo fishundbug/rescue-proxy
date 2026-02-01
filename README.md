@@ -2,6 +2,8 @@
 
 SillyTavern 后端插件 —— AI 响应救援代理服务器
 
+中文 | [English](README_EN.md)
+
 > ⚠️ **重要提示**：本插件需要配合前端扩展 [rescue-proxy-ui](https://github.com/fishundbug/rescue-proxy-ui) 一起使用才能正常工作。
 
 ## ✨ 特性
